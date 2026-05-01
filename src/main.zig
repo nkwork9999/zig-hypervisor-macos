@@ -548,7 +548,6 @@ pub fn main() !void {
                             _ = hv_vcpu_get_reg(vcpu, rg, &v);
                             const irq_num: u32 = @intCast(v & 0x3FF);
                             gic.cpuWrite(off, @intCast(v & 0xFFFF_FFFF));
-                            // EOIR for vTimer IRQ → unmask vtimer (Apple Hypervisor自動マスク解除)
                             if (off == 0x010 and irq_num == VTIMER_IRQ) {
                                 _ = hv_vcpu_set_vtimer_mask(vcpu, false);
                             }
@@ -638,9 +637,15 @@ pub fn main() !void {
                 },
             }
         } else if (exit_info.reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
-            // vTimer発火 → GIC内部でIRQ 27をペンディング → 配信可なら set_pending_interrupt
+            // vTimer 安定化:
+            //   1) CVAL を 4ms 先に強制セット (Linux が IRQ 無効区間で CVAL 更新できない場合の deadlock 回避)
+            //   2) CTL を ENABLE=1 / IMASK=0 に強制 (Linux が disable していても firing 維持)
+            //   3) Apple Hypervisor.framework の auto-mask を即解除
             timer_fires += 1;
-            _ = hv_vcpu_set_vtimer_mask(vcpu, true);
+            const next_cval = mach_absolute_time() + 100_000; // ~4ms at 24MHz
+            _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTV_CVAL_EL0, next_cval - vtimer_offset);
+            _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTV_CTL_EL0, 1);
+            _ = hv_vcpu_set_vtimer_mask(vcpu, false);
             if (gic.assertIrq(VTIMER_IRQ)) {
                 _ = hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ, true);
             }

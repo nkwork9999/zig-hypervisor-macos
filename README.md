@@ -174,12 +174,17 @@ zig build test
 - ✅ **ターミナル経由 shell**: PL011 (host stdout/stdin) で対話 shell 動作
 
 #### ⚠️ 詰み: window で打鍵 → fbcon shell が echo されない
-1. simpledrm を modprobe ロードすると fbcon takeover ✓
-2. その直後 kernel が **soft lockup**: `watchdog: BUG: soft lockup - CPU#0 stuck for 22s`
-3. /init の続き (`exec /bin/sh -i`) まで到達できず shell 起動せず
-4. キー入力は流れるが受け手 (shell) が居ない
 
-**根因推定**: 我々の最小 GICv2 + WFI/SDL/IRQ ハンドリングが simpledrm の DRM 初期化シーケンスでデッドロック。深掘り未実施。
+**調査結果 (2026-05-02)**:
+1. **vTimer 問題は解消可能**: VTIMER_ACTIVATED 時に `CNTV_CVAL_EL0 = now+4ms` を強制設定 + `CNTV_CTL_EL0 = 1` 強制 enable + `set_vtimer_mask(false)` 即解除すれば storm/deadlock とも回避できる (実装済)
+2. **本当の hang ポイントは `drm.ko` 自身の `module_init`**: モジュールを 1 個ずつ insmod して特定 (Step A: fb.ko OK / Step B: fb helpers 全 OK / Step C: drm.ko で永久待ち)
+3. `fb.ko` + `syscopyarea/sysfillrect/sysimgblt/fb_sys_fops` 等のヘルパーは全部ロード成功
+4. `drm.ko` が wait_for_completion / lock 待ち / kthread 待ち等で待つが、何を待っているかは Linux ソース無しでは特定困難
+5. `simplefb` (古い非DRM版) は kernel に built-in されてない (modular のみ、しかも Alpine の initramfs に含まれない)
+6. `virtio-gpu.ko` は存在するが VirtIO バス実装が必要 (大型実装)
+
+**結論: Linux の DRM/fb モジュール経路は本プロジェクトの最小ハードウェア環境では難所**。
+解決策は (1) **VirtIO-GPU 完全実装** か (2) **zigvm 側で自前ターミナルレンダリング** (PL011 TX を 8x16 font で FB に直接描画 → DRM/fbcon 不要)。
 
 #### Window で実用 shell に必要な追加実装
 
