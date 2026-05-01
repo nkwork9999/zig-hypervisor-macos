@@ -1,169 +1,259 @@
 const std = @import("std");
+const posix = std.posix;
+const hv = @import("hv.zig");
+const dtb = @import("dtb.zig");
+const gic_mod = @import("gic.zig");
+const pl011_mod = @import("pl011.zig");
 
-const hv_return_t = i32;
-const HV_SUCCESS: hv_return_t = 0;
-const HV_MEMORY_READ: u64 = 1 << 0;
-const HV_MEMORY_WRITE: u64 = 1 << 1;
-const HV_MEMORY_EXEC: u64 = 1 << 2;
+// hv 名前空間のショートカット
+const HV_SUCCESS = hv.HV_SUCCESS;
+const HV_REG_X0 = hv.HV_REG_X0;
+const HV_REG_PC = hv.HV_REG_PC;
+const HV_REG_CPSR = hv.HV_REG_CPSR;
+const HV_SYS_REG_VBAR_EL1 = hv.HV_SYS_REG_VBAR_EL1;
+const HV_SYS_REG_SP_EL0 = hv.HV_SYS_REG_SP_EL0;
+const HV_SYS_REG_SP_EL1 = hv.HV_SYS_REG_SP_EL1;
+const HV_SYS_REG_CNTV_CTL_EL0 = hv.HV_SYS_REG_CNTV_CTL_EL0;
+const HV_SYS_REG_CNTV_CVAL_EL0 = hv.HV_SYS_REG_CNTV_CVAL_EL0;
+const HV_MEMORY_READ = hv.HV_MEMORY_READ;
+const HV_MEMORY_WRITE = hv.HV_MEMORY_WRITE;
+const HV_MEMORY_EXEC = hv.HV_MEMORY_EXEC;
+const EC_HVC = hv.EC_HVC;
+const EC_DATA_ABORT = hv.EC_DATA_ABORT;
+const EC_BRK = hv.EC_BRK;
+const HV_EXIT_REASON_EXCEPTION = hv.HV_EXIT_REASON_EXCEPTION;
+const HV_EXIT_REASON_VTIMER_ACTIVATED = hv.HV_EXIT_REASON_VTIMER_ACTIVATED;
+const HV_INTERRUPT_TYPE_IRQ = hv.HV_INTERRUPT_TYPE_IRQ;
+const hv_vm_create = hv.hv_vm_create;
+const hv_vm_destroy = hv.hv_vm_destroy;
+const hv_vm_map = hv.hv_vm_map;
+const hv_vm_unmap = hv.hv_vm_unmap;
+const hv_vcpu_create = hv.hv_vcpu_create;
+const hv_vcpu_destroy = hv.hv_vcpu_destroy;
+const hv_vcpu_run = hv.hv_vcpu_run;
+const hv_vcpu_get_reg = hv.hv_vcpu_get_reg;
+const hv_vcpu_set_reg = hv.hv_vcpu_set_reg;
+const hv_vcpu_set_sys_reg = hv.hv_vcpu_set_sys_reg;
+const hv_vcpu_set_trap_debug_exceptions = hv.hv_vcpu_set_trap_debug_exceptions;
+const hv_vcpu_set_vtimer_mask = hv.hv_vcpu_set_vtimer_mask;
+const hv_vcpu_get_vtimer_offset = hv.hv_vcpu_get_vtimer_offset;
+const hv_vcpu_set_pending_interrupt = hv.hv_vcpu_set_pending_interrupt;
+const mach_absolute_time = hv.mach_absolute_time;
+const HVExitInfo = hv.HVExitInfo;
 
-const HV_REG_X0: u32 = 0;
-const HV_REG_X1: u32 = 1;
-const HV_REG_PC: u32 = 31;
-const HV_REG_CPSR: u32 = 32;
-const HV_SYS_REG_SP_EL0: u16 = 0xC208;
-const HV_SYS_REG_SP_EL1: u16 = 0xE208;
-const HV_SYS_REG_VBAR_EL1: u16 = 0xC600;
+fn uart_out(c: u8) void {
+    std.debug.print("{c}", .{c});
+}
 
-const EC_DATA_ABORT: u32 = 0x24;
-const EC_BRK: u32 = 0x3C;
-const EC_HVC: u32 = 0x16;
-const HV_EXIT_REASON_EXCEPTION: u32 = 1;
+// PSCI function IDs (SMC32 variant, prefix 0x84)
+const PSCI_VERSION: u64 = 0x84000000;
+const PSCI_CPU_OFF: u64 = 0x84000002;
+const PSCI_SYSTEM_OFF: u64 = 0x84000008;
+const PSCI_SYSTEM_RESET: u64 = 0x84000009;
+const PSCI_FEATURES: u64 = 0x8400000A;
 
-const HVExitInfo = extern struct {
-    reason: u32,
-    exception: extern struct {
-        syndrome: u64,
-        virtual_address: u64,
-        physical_address: u64,
-    },
-};
+const PSCI_RET_SUCCESS: u64 = 0;
+const PSCI_RET_NOT_SUPPORTED: u64 = @bitCast(@as(i64, -1));
+const PSCI_VERSION_1_1: u64 = 0x00010001;
 
-extern "Hypervisor" fn hv_vm_create(config: ?*anyopaque) hv_return_t;
-extern "Hypervisor" fn hv_vm_destroy() hv_return_t;
-extern "Hypervisor" fn hv_vcpu_create(vcpu: *u64, exit: **HVExitInfo, config: ?*anyopaque) hv_return_t;
-extern "Hypervisor" fn hv_vcpu_destroy(vcpu: u64) hv_return_t;
-extern "Hypervisor" fn hv_vcpu_run(vcpu: u64) hv_return_t;
-extern "Hypervisor" fn hv_vcpu_get_reg(vcpu: u64, reg: u32, value: *u64) hv_return_t;
-extern "Hypervisor" fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) hv_return_t;
-extern "Hypervisor" fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) hv_return_t;
-extern "Hypervisor" fn hv_vcpu_set_trap_debug_exceptions(vcpu: u64, enable: bool) hv_return_t;
-extern "Hypervisor" fn hv_vm_map(addr: *anyopaque, ipa: u64, size: usize, flags: u64) hv_return_t;
-extern "Hypervisor" fn hv_vm_unmap(ipa: u64, size: usize) hv_return_t;
-
-const MEM_SIZE: usize = 0x200000;
+const MEM_SIZE: usize = 0x20000000; // 512MB
 const MEM_ADDR: u64 = 0x40000000;
 const UART_BASE: u64 = 0x09000000;
-const CODE_OFFSET: u64 = 0x1000;
-const DTB_OFFSET: u64 = 0x100000;
+const TIMER_SLEEP_ADDR: u64 = 0x09001000;
+const GIC_DIST_BASE: u64 = 0x08000000; // GICv2 Distributor
+const GIC_CPU_BASE: u64 = 0x08010000; // GICv2 CPU Interface
+const DTB_LOAD_ADDR: u64 = 0x44000000; // メモリ上端付近 (mem内)
+const INITRD_LOAD_ADDR: u64 = 0x45000000; // DTBより上、initramfs用
 
-const FDT_MAGIC: u32 = 0xD00DFEED;
-const FDT_BEGIN_NODE: u32 = 1;
-const FDT_END_NODE: u32 = 2;
-const FDT_PROP: u32 = 3;
-const FDT_END: u32 = 9;
+// ============== ELF Loader ==============
 
-fn be32(v: u32) u32 {
-    return @byteSwap(v);
-}
-fn be64(v: u64) u64 {
-    return @byteSwap(v);
-}
+const ELF_MAGIC = "\x7fELF";
 
-fn generateDTB(buf: []u8) usize {
-    const strings = "compatible\x00#address-cells\x00#size-cells\x00model\x00device_type\x00reg\x00bootargs\x00stdout-path\x00";
-    var struct_buf: [2048]u8 = undefined;
-    var s: usize = 0;
+const Elf64Header = extern struct {
+    e_ident: [16]u8,
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+};
 
-    const addU32 = struct {
-        fn f(b: []u8, o: *usize, v: u32) void {
-            @memcpy(b[o.*..][0..4], &@as([4]u8, @bitCast(be32(v))));
-            o.* += 4;
+const Elf64Phdr = extern struct {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+};
+
+const PT_LOAD: u32 = 1;
+
+const ElfLoadResult = struct {
+    entry_point: u64,
+    loaded: bool,
+};
+
+fn loadElf(elf_data: []const u8, guest_mem: []u8, mem_base: u64) ElfLoadResult {
+    // マジック確認
+    if (elf_data.len < @sizeOf(Elf64Header)) {
+        std.debug.print("[ELF] ファイルが小さすぎる\n", .{});
+        return .{ .entry_point = 0, .loaded = false };
+    }
+
+    if (!std.mem.eql(u8, elf_data[0..4], ELF_MAGIC)) {
+        std.debug.print("[ELF] 無効なマジック\n", .{});
+        return .{ .entry_point = 0, .loaded = false };
+    }
+
+    // ELFヘッダー解析
+    const header: *const Elf64Header = @ptrCast(@alignCast(elf_data.ptr));
+
+    // AArch64確認 (0xB7 = EM_AARCH64)
+    if (header.e_machine != 0xB7) {
+        std.debug.print("[ELF] 非AArch64バイナリ: 0x{X}\n", .{header.e_machine});
+        return .{ .entry_point = 0, .loaded = false };
+    }
+
+    std.debug.print("[ELF] エントリポイント: 0x{X}\n", .{header.e_entry});
+    std.debug.print("[ELF] Program Headers: {} 個\n", .{header.e_phnum});
+
+    // プログラムヘッダー処理
+    var i: u16 = 0;
+    while (i < header.e_phnum) : (i += 1) {
+        const ph_offset = header.e_phoff + i * header.e_phentsize;
+        if (ph_offset + @sizeOf(Elf64Phdr) > elf_data.len) break;
+
+        const phdr: *const Elf64Phdr = @ptrCast(@alignCast(elf_data.ptr + ph_offset));
+
+        if (phdr.p_type != PT_LOAD) continue;
+
+        std.debug.print("[ELF] LOAD: vaddr=0x{X} filesz={} memsz={}\n", .{
+            phdr.p_vaddr, phdr.p_filesz, phdr.p_memsz
+        });
+
+        // ゲストメモリにコピー
+        const dest_offset = phdr.p_vaddr - mem_base;
+        if (dest_offset + phdr.p_filesz > guest_mem.len) {
+            std.debug.print("[ELF] メモリ範囲外\n", .{});
+            continue;
         }
-    }.f;
-    const addStr = struct {
-        fn f(b: []u8, o: *usize, str: []const u8) void {
-            @memcpy(b[o.*..][0..str.len], str);
-            o.* += str.len;
-            b[o.*] = 0;
-            o.* += 1;
-            while (o.* % 4 != 0) : (o.* += 1) b[o.*] = 0;
+
+        const src = elf_data[phdr.p_offset..][0..phdr.p_filesz];
+        const dest = guest_mem[dest_offset..][0..phdr.p_filesz];
+        @memcpy(dest, src);
+
+        // BSSゼロクリア
+        if (phdr.p_memsz > phdr.p_filesz) {
+            const bss_size = phdr.p_memsz - phdr.p_filesz;
+            const bss_start = dest_offset + phdr.p_filesz;
+            if (bss_start + bss_size <= guest_mem.len) {
+                @memset(guest_mem[bss_start..][0..bss_size], 0);
+            }
         }
-    }.f;
-    const addProp = struct {
-        fn f(b: []u8, o: *usize, noff: u32, data: []const u8) void {
-            @memcpy(b[o.*..][0..4], &@as([4]u8, @bitCast(be32(FDT_PROP))));
-            o.* += 4;
-            @memcpy(b[o.*..][0..4], &@as([4]u8, @bitCast(be32(@intCast(data.len)))));
-            o.* += 4;
-            @memcpy(b[o.*..][0..4], &@as([4]u8, @bitCast(be32(noff))));
-            o.* += 4;
-            @memcpy(b[o.*..][0..data.len], data);
-            o.* += data.len;
-            while (o.* % 4 != 0) : (o.* += 1) b[o.*] = 0;
-        }
-    }.f;
+    }
 
-    addU32(&struct_buf, &s, FDT_BEGIN_NODE);
-    addStr(&struct_buf, &s, "");
-    addProp(&struct_buf, &s, 0, "linux,dummy-virt");
-    addProp(&struct_buf, &s, 39, "ZigVM");
-    addProp(&struct_buf, &s, 11, &@as([4]u8, @bitCast(be32(2))));
-    addProp(&struct_buf, &s, 26, &@as([4]u8, @bitCast(be32(2))));
-
-    addU32(&struct_buf, &s, FDT_BEGIN_NODE);
-    addStr(&struct_buf, &s, "chosen");
-    addProp(&struct_buf, &s, 61, "console=ttyAMA0");
-    addProp(&struct_buf, &s, 70, "/pl011@9000000");
-    addU32(&struct_buf, &s, FDT_END_NODE);
-
-    addU32(&struct_buf, &s, FDT_BEGIN_NODE);
-    addStr(&struct_buf, &s, "memory@40000000");
-    addProp(&struct_buf, &s, 45, "memory");
-    var mr: [32]u8 = undefined;
-    @memcpy(mr[0..8], &@as([8]u8, @bitCast(be64(0))));
-    @memcpy(mr[8..16], &@as([8]u8, @bitCast(be64(MEM_ADDR))));
-    @memcpy(mr[16..24], &@as([8]u8, @bitCast(be64(0))));
-    @memcpy(mr[24..32], &@as([8]u8, @bitCast(be64(MEM_SIZE))));
-    addProp(&struct_buf, &s, 57, &mr);
-    addU32(&struct_buf, &s, FDT_END_NODE);
-
-    addU32(&struct_buf, &s, FDT_BEGIN_NODE);
-    addStr(&struct_buf, &s, "pl011@9000000");
-    addProp(&struct_buf, &s, 0, "arm,pl011\x00arm,primecell");
-    var ur: [16]u8 = undefined;
-    @memcpy(ur[0..8], &@as([8]u8, @bitCast(be64(UART_BASE))));
-    @memcpy(ur[8..16], &@as([8]u8, @bitCast(be64(0x1000))));
-    addProp(&struct_buf, &s, 57, &ur);
-    addU32(&struct_buf, &s, FDT_END_NODE);
-
-    addU32(&struct_buf, &s, FDT_END_NODE);
-    addU32(&struct_buf, &s, FDT_END);
-
-    const hdr: u32 = 40;
-    const rsv: u32 = 16;
-    const soff: u32 = hdr + rsv;
-    const ssz: u32 = @intCast(s);
-    const stoff: u32 = soff + ssz;
-    const stsz: u32 = @intCast(strings.len);
-    const tot: u32 = stoff + stsz;
-
-    var o: usize = 0;
-    addU32(buf, &o, FDT_MAGIC);
-    addU32(buf, &o, tot);
-    addU32(buf, &o, soff);
-    addU32(buf, &o, stoff);
-    addU32(buf, &o, hdr);
-    addU32(buf, &o, 17);
-    addU32(buf, &o, 16);
-    addU32(buf, &o, 0);
-    addU32(buf, &o, stsz);
-    addU32(buf, &o, ssz);
-    @memset(buf[o..][0..16], 0);
-    o += 16;
-    @memcpy(buf[o..][0..s], struct_buf[0..s]);
-    o += s;
-    @memcpy(buf[o..][0..strings.len], strings);
-    return o + strings.len;
+    return .{ .entry_point = header.e_entry, .loaded = true };
 }
+
+// ============== ARM64 Linux Image Loader ==============
+// Image header (64 bytes):
+//   [0..7]   code0+code1 (executable, usually `b primary_entry`)
+//   [8..15]  text_offset (u64 LE)
+//   [16..23] image_size  (u64 LE)
+//   [24..31] flags       (u64 LE)
+//   [32..55] reserved
+//   [56..59] magic = 0x644D5241 ("ARM\x64" LE)
+//   [60..63] reserved
+const ARM64_IMAGE_MAGIC: u32 = 0x644D5241;
+
+const ImageLoadResult = struct {
+    entry_point: u64,
+    loaded: bool,
+};
+
+fn loadImage(image_data: []const u8, guest_mem: []u8, mem_base: u64) ImageLoadResult {
+    if (image_data.len < 64) {
+        std.debug.print("[Image] ヘッダ不足\n", .{});
+        return .{ .entry_point = 0, .loaded = false };
+    }
+    const magic = std.mem.readInt(u32, image_data[56..60], .little);
+    if (magic != ARM64_IMAGE_MAGIC) {
+        return .{ .entry_point = 0, .loaded = false };
+    }
+    const text_offset = std.mem.readInt(u64, image_data[8..16], .little);
+    const image_size = std.mem.readInt(u64, image_data[16..24], .little);
+    const flags = std.mem.readInt(u64, image_data[24..32], .little);
+    std.debug.print("[Image] ARM64 magic OK\n", .{});
+    std.debug.print("[Image] text_offset=0x{X} image_size=0x{X} flags=0x{X}\n", .{ text_offset, image_size, flags });
+
+    const dest_offset = text_offset;
+    if (dest_offset + image_data.len > guest_mem.len) {
+        std.debug.print("[Image] メモリ範囲外\n", .{});
+        return .{ .entry_point = 0, .loaded = false };
+    }
+    @memcpy(guest_mem[dest_offset..][0..image_data.len], image_data);
+    return .{ .entry_point = mem_base + dest_offset, .loaded = true };
+}
+
+// ELFかImageかを判別してロード
+fn loadKernel(data: []const u8, guest_mem: []u8, mem_base: u64) ElfLoadResult {
+    // ELFマジック確認
+    if (data.len >= 4 and std.mem.eql(u8, data[0..4], ELF_MAGIC)) {
+        return loadElf(data, guest_mem, mem_base);
+    }
+    // Imageフォーマット試行
+    const img = loadImage(data, guest_mem, mem_base);
+    return .{ .entry_point = img.entry_point, .loaded = img.loaded };
+}
+
+// ============== Main ==============
 
 pub fn main() !void {
     std.debug.print("\n", .{});
-    std.debug.print("================================================================\n", .{});
-    std.debug.print("           ZigVM - ARM64 Virtual Machine Monitor\n", .{});
-    std.debug.print("                   Final: Linux Boot Demo\n", .{});
-    std.debug.print("================================================================\n\n", .{});
+    std.debug.print("========================================\n", .{});
+    std.debug.print("  ZigVM - ELF Kernel Loader\n", .{});
+    std.debug.print("========================================\n\n", .{});
 
-    if (hv_vm_create(null) != HV_SUCCESS) return;
+    // カーネル読み込み (引数で指定、なければデフォルト)
+    const args = std.process.argsAlloc(std.heap.page_allocator) catch {
+        std.debug.print("[VMM] argsAlloc 失敗\n", .{});
+        return;
+    };
+    defer std.process.argsFree(std.heap.page_allocator, args);
+    const kernel_path = if (args.len >= 2) args[1] else "../202601zigos/zig-out/bin/kernel";
+    const initrd_path: ?[]const u8 = if (args.len >= 3) args[2] else null;
+    std.debug.print("[VMM] カーネルパス: {s}\n", .{kernel_path});
+    if (initrd_path) |p| std.debug.print("[VMM] initramfs: {s}\n", .{p});
+    const kernel_file = std.fs.cwd().openFile(kernel_path, .{}) catch |err| {
+        std.debug.print("[VMM] カーネル読み込み失敗: {s}\n", .{kernel_path});
+        std.debug.print("[VMM] エラー: {}\n", .{err});
+        return;
+    };
+    defer kernel_file.close();
+
+    const kernel_data = kernel_file.readToEndAlloc(std.heap.page_allocator, 64 * 1024 * 1024) catch {
+        std.debug.print("[VMM] カーネル読み込み失敗\n", .{});
+        return;
+    };
+    defer std.heap.page_allocator.free(kernel_data);
+    std.debug.print("[VMM] カーネルファイル: {} bytes\n", .{kernel_data.len});
+
+    // VM作成
+    if (hv_vm_create(null) != HV_SUCCESS) {
+        std.debug.print("[VMM] VM作成失敗\n", .{});
+        return;
+    }
 
     const guest_mem = std.heap.page_allocator.alloc(u8, MEM_SIZE) catch {
         _ = hv_vm_destroy();
@@ -172,7 +262,7 @@ pub fn main() !void {
     defer std.heap.page_allocator.free(guest_mem);
     @memset(guest_mem, 0);
 
-    // Exception vectors
+    // 例外ベクタ
     var i: usize = 0;
     while (i < 0x800) : (i += 4) {
         guest_mem[i] = 0xE0;
@@ -181,88 +271,154 @@ pub fn main() !void {
         guest_mem[i + 3] = 0xD4;
     }
 
-    // Generate DTB
-    const dtb_off: usize = @intCast(DTB_OFFSET);
-    const dtb_size = generateDTB(guest_mem[dtb_off..]);
-    std.debug.print("[VMM] DTB generated: {} bytes at 0x{X}\n", .{ dtb_size, MEM_ADDR + DTB_OFFSET });
-
-    // Generate guest code
-    const code_off: usize = @intCast(CODE_OFFSET);
-    var c: usize = 0;
-
-    // mov x19, x0 (save DTB)
-    guest_mem[code_off + c] = 0xF3;
-    guest_mem[code_off + c + 1] = 0x03;
-    guest_mem[code_off + c + 2] = 0x00;
-    guest_mem[code_off + c + 3] = 0xAA;
-    c += 4;
-
-    // movz x1, #0x0900, lsl #16 (UART = 0x09000000)
-    guest_mem[code_off + c] = 0x01;
-    guest_mem[code_off + c + 1] = 0x20;
-    guest_mem[code_off + c + 2] = 0xA1;
-    guest_mem[code_off + c + 3] = 0xD2;
-    c += 4;
-
-    // Print banner
-    const banner = "\n[GUEST] ZigVM Linux Boot!\n[GUEST] ARM64 Boot Protocol OK\n[GUEST] DTB received\n";
-    for (banner) |ch| {
-        // movz x0, #ch
-        const imm = @as(u32, ch) << 5;
-        const inst = 0xD2800000 | imm;
-        guest_mem[code_off + c] = @intCast(inst & 0xFF);
-        guest_mem[code_off + c + 1] = @intCast((inst >> 8) & 0xFF);
-        guest_mem[code_off + c + 2] = @intCast((inst >> 16) & 0xFF);
-        guest_mem[code_off + c + 3] = @intCast((inst >> 24) & 0xFF);
-        c += 4;
-        // str x0, [x1]
-        guest_mem[code_off + c] = 0x20;
-        guest_mem[code_off + c + 1] = 0x00;
-        guest_mem[code_off + c + 2] = 0x00;
-        guest_mem[code_off + c + 3] = 0xF9;
-        c += 4;
+    // ELF or Image ロード
+    const elf_result = loadKernel(kernel_data, guest_mem, MEM_ADDR);
+    if (!elf_result.loaded) {
+        std.debug.print("[VMM] カーネルロード失敗 (ELF/Image どちらでもない)\n", .{});
+        _ = hv_vm_destroy();
+        return;
     }
 
-    // hvc #1 (print DTB addr)
-    guest_mem[code_off + c] = 0x22;
-    guest_mem[code_off + c + 1] = 0x00;
-    guest_mem[code_off + c + 2] = 0x00;
-    guest_mem[code_off + c + 3] = 0xD4;
-    c += 4;
+    std.debug.print("[VMM] ロード完了\n", .{});
 
-    // brk #0
-    guest_mem[code_off + c] = 0x00;
-    guest_mem[code_off + c + 1] = 0x00;
-    guest_mem[code_off + c + 2] = 0x20;
-    guest_mem[code_off + c + 3] = 0xD4;
+    // initramfs ロード
+    var initrd_size: u64 = 0;
+    if (initrd_path) |p| {
+        const initrd_file = std.fs.cwd().openFile(p, .{}) catch |err| {
+            std.debug.print("[VMM] initramfs open失敗: {}\n", .{err});
+            _ = hv_vm_destroy();
+            return;
+        };
+        defer initrd_file.close();
+        const initrd_data = initrd_file.readToEndAlloc(std.heap.page_allocator, 64 * 1024 * 1024) catch {
+            std.debug.print("[VMM] initramfs読み込み失敗\n", .{});
+            _ = hv_vm_destroy();
+            return;
+        };
+        defer std.heap.page_allocator.free(initrd_data);
+        const initrd_offset = INITRD_LOAD_ADDR - MEM_ADDR;
+        if (initrd_offset + initrd_data.len > guest_mem.len) {
+            std.debug.print("[VMM] initramfsがメモリ範囲外\n", .{});
+            _ = hv_vm_destroy();
+            return;
+        }
+        @memcpy(guest_mem[initrd_offset..][0..initrd_data.len], initrd_data);
+        initrd_size = initrd_data.len;
+        std.debug.print("[VMM] initramfs: {} bytes @ 0x{X}\n", .{ initrd_size, INITRD_LOAD_ADDR });
+    }
 
-    std.debug.print("[VMM] Guest code: {} bytes at 0x{X}\n", .{ c + 4, MEM_ADDR + CODE_OFFSET });
+    // DTB 生成 & ゲストメモリにコピー
+    const dtb_bytes = dtb.buildZigVmDtb(std.heap.page_allocator, .{
+        .mem_base = MEM_ADDR,
+        .mem_size = MEM_SIZE,
+        .uart_base = UART_BASE,
+        .gic_dist_base = GIC_DIST_BASE,
+        .gic_cpu_base = GIC_CPU_BASE,
+        .bootargs = "console=ttyAMA0 earlycon=pl011,0x9000000 single usbdelay=1 quiet loglevel=3",
+        .initrd_start = if (initrd_size > 0) INITRD_LOAD_ADDR else 0,
+        .initrd_end = if (initrd_size > 0) INITRD_LOAD_ADDR + initrd_size else 0,
+    }) catch {
+        std.debug.print("[VMM] DTB生成失敗\n", .{});
+        _ = hv_vm_destroy();
+        return;
+    };
+    defer std.heap.page_allocator.free(dtb_bytes);
 
+    const dtb_offset = DTB_LOAD_ADDR - MEM_ADDR;
+    if (dtb_offset + dtb_bytes.len > guest_mem.len) {
+        std.debug.print("[VMM] DTB配置アドレスがメモリ範囲外\n", .{});
+        _ = hv_vm_destroy();
+        return;
+    }
+    @memcpy(guest_mem[dtb_offset..][0..dtb_bytes.len], dtb_bytes);
+    std.debug.print("[VMM] DTB: {} bytes @ 0x{X}\n", .{ dtb_bytes.len, DTB_LOAD_ADDR });
+
+    // メモリマップ
     if (hv_vm_map(@ptrCast(guest_mem.ptr), MEM_ADDR, MEM_SIZE, HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC) != HV_SUCCESS) {
         _ = hv_vm_destroy();
         return;
     }
 
+    // vCPU作成
     var vcpu: u64 = 0;
     var exit_info: *HVExitInfo = undefined;
     _ = hv_vcpu_create(&vcpu, &exit_info, null);
-
-    const DTB_ADDR = MEM_ADDR + DTB_OFFSET;
     _ = hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0x3c5);
-    _ = hv_vcpu_set_reg(vcpu, HV_REG_PC, MEM_ADDR + CODE_OFFSET);
-    _ = hv_vcpu_set_reg(vcpu, HV_REG_X0, DTB_ADDR);
+    _ = hv_vcpu_set_reg(vcpu, HV_REG_PC, elf_result.entry_point);
+    // Linux boot protocol: x0 = DTB address, x1..x3 = 0 (reserved)
+    _ = hv_vcpu_set_reg(vcpu, HV_REG_X0, DTB_LOAD_ADDR);
+    var rn: u32 = 1;
+    while (rn <= 7) : (rn += 1) {
+        _ = hv_vcpu_set_reg(vcpu, rn, 0);
+    }
     _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, MEM_ADDR + 0x8000);
     _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, MEM_ADDR + 0x10000);
     _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, MEM_ADDR);
     _ = hv_vcpu_set_trap_debug_exceptions(vcpu, true);
 
-    std.debug.print("[VMM] vCPU ready: PC=0x{X}, x0=0x{X}\n\n", .{ MEM_ADDR + CODE_OFFSET, DTB_ADDR });
-    std.debug.print("-------------------- Guest Output --------------------", .{});
+    // vTimer セットアップ
+    var vtimer_offset: u64 = 0;
+    _ = hv_vcpu_get_vtimer_offset(vcpu, &vtimer_offset);
 
+    // IRQ/FIQ pending をクリア。vTimerはLinuxが使うのでunmask。
+    _ = hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ, false);
+    _ = hv_vcpu_set_vtimer_mask(vcpu, false);
+
+    // GIC 状態
+    var gic: gic_mod.Gic = .{};
+    const VTIMER_IRQ: u32 = 27; // PPI 11 = IRQ ID 27
+    const PL011_IRQ: u32 = 33; // DTBの interrupts=<0 1 4> → SPI ID 1 = GIC IRQ 32+1
+
+    // PL011 UART 状態
+    var pl011: pl011_mod.Pl011 = pl011_mod.Pl011.init(uart_out);
+
+    // ホスト stdin を non-blocking化 (tty/pipe両対応で PL011 RX に流す)
+    const stdin_fd: posix.fd_t = 0;
+    const O_NONBLOCK: u32 = 0x0004; // Darwin
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const orig_flags = std.c.fcntl(stdin_fd, F_GETFL, @as(i32, 0));
+    _ = std.c.fcntl(stdin_fd, F_SETFL, orig_flags | @as(i32, @intCast(O_NONBLOCK)));
+
+    var orig_termios: posix.termios = undefined;
+    const have_tty = posix.isatty(stdin_fd);
+    if (have_tty) {
+        orig_termios = posix.tcgetattr(stdin_fd) catch undefined;
+        var raw = orig_termios;
+        raw.lflag.ICANON = false;
+        raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        raw.cc[@intFromEnum(posix.V.MIN)] = 0;
+        raw.cc[@intFromEnum(posix.V.TIME)] = 0;
+        posix.tcsetattr(stdin_fd, .NOW, raw) catch {};
+    }
+    defer {
+        if (have_tty) posix.tcsetattr(stdin_fd, .NOW, orig_termios) catch {};
+        _ = std.c.fcntl(stdin_fd, F_SETFL, orig_flags);
+    }
+
+    std.debug.print("[VMM] PC=0x{X}\n", .{elf_result.entry_point});
+    std.debug.print("[VMM] vTimer offset: 0x{X}\n", .{vtimer_offset});
+    std.debug.print("[VMM] vCPU開始\n", .{});
+    std.debug.print("--- MyOS ---\n", .{});
+
+    // 実行ループ
     var running = true;
     var pc: u64 = 0;
+    var timer_fires: u32 = 0;
 
     while (running) {
+        // 1) ホスト stdin → PL011 RX 配線 (tty/pipe両対応)
+        var sbuf: [16]u8 = undefined;
+        const n = posix.read(stdin_fd, &sbuf) catch 0;
+        if (n > 0) {
+            for (sbuf[0..n]) |c| pl011.pushRxChar(c);
+        }
+        // 2) PL011 RX IRQ pending → GIC SPI 1 配信 (毎ループでチェック)
+        if (pl011.rxIrqPending() and gic.assertIrq(PL011_IRQ)) {
+            _ = hv_vcpu_set_pending_interrupt(vcpu, hv.HV_INTERRUPT_TYPE_IRQ, true);
+        }
+
         if (hv_vcpu_run(vcpu) != HV_SUCCESS) break;
         _ = hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
 
@@ -275,48 +431,142 @@ pub fn main() !void {
                 EC_DATA_ABORT => {
                     const wr = ((syn >> 6) & 1) == 1;
                     const rg = @as(u32, @intCast((syn >> 16) & 0x1F));
-                    if (ipa >= UART_BASE and ipa < UART_BASE + 0x1000 and wr) {
-                        var v: u64 = 0;
-                        _ = hv_vcpu_get_reg(vcpu, rg, &v);
-                        std.debug.print("{c}", .{@as(u8, @intCast(v & 0xFF))});
+
+                    if (ipa >= UART_BASE and ipa < UART_BASE + 0x1000) {
+                        const off: u32 = @intCast(ipa - UART_BASE);
+                        if (wr) {
+                            var v: u64 = 0;
+                            _ = hv_vcpu_get_reg(vcpu, rg, &v);
+                            pl011.write(off, @intCast(v & 0xFFFF_FFFF));
+                        } else {
+                            const v = pl011.read(off);
+                            _ = hv_vcpu_set_reg(vcpu, rg, v);
+                        }
+                    } else if (ipa >= GIC_DIST_BASE and ipa < GIC_DIST_BASE + 0x10000) {
+                        // GICD MMIO
+                        const off: u32 = @intCast(ipa - GIC_DIST_BASE);
+                        if (wr) {
+                            var v: u64 = 0;
+                            _ = hv_vcpu_get_reg(vcpu, rg, &v);
+                            gic.distWrite(off, @intCast(v & 0xFFFF_FFFF));
+                        } else {
+                            const v = gic.distRead(off);
+                            _ = hv_vcpu_set_reg(vcpu, rg, v);
+                        }
+                    } else if (ipa >= GIC_CPU_BASE and ipa < GIC_CPU_BASE + 0x10000) {
+                        // GICC MMIO
+                        const off: u32 = @intCast(ipa - GIC_CPU_BASE);
+                        if (wr) {
+                            var v: u64 = 0;
+                            _ = hv_vcpu_get_reg(vcpu, rg, &v);
+                            const irq_num: u32 = @intCast(v & 0x3FF);
+                            gic.cpuWrite(off, @intCast(v & 0xFFFF_FFFF));
+                            // EOIR for vTimer IRQ → unmask vtimer (Apple Hypervisor自動マスク解除)
+                            if (off == 0x010 and irq_num == VTIMER_IRQ) {
+                                _ = hv_vcpu_set_vtimer_mask(vcpu, false);
+                            }
+                        } else {
+                            const v = gic.cpuRead(off);
+                            _ = hv_vcpu_set_reg(vcpu, rg, v);
+                        }
+                        // GIC状態変化後はIRQライン再評価
+                        const should = gic.shouldDeliver();
+                        _ = hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ, should);
+                    } else if (ipa == TIMER_SLEEP_ADDR and wr) {
+                        // TIMER_SLEEP書き込み: vTimer武装 (GIC通過のIRQに変更)
+                        var delay: u64 = 0;
+                        _ = hv_vcpu_get_reg(vcpu, rg, &delay);
+                        const now = mach_absolute_time();
+                        const cval = now + delay - vtimer_offset;
+                        _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTV_CVAL_EL0, cval);
+                        _ = hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTV_CTL_EL0, 1);
+                        _ = hv_vcpu_set_vtimer_mask(vcpu, false);
                     }
                     _ = hv_vcpu_set_reg(vcpu, HV_REG_PC, pc + 4);
                 },
                 EC_HVC => {
-                    var x19: u64 = 0;
-                    _ = hv_vcpu_get_reg(vcpu, 19, &x19);
-                    std.debug.print("[GUEST] DTB @ 0x{X}\n", .{x19});
+                    // PSCI ハンドリング (x0=function ID)
+                    var fn_id: u64 = 0;
+                    _ = hv_vcpu_get_reg(vcpu, HV_REG_X0, &fn_id);
+                    var ret: u64 = PSCI_RET_NOT_SUPPORTED;
+                    var should_stop = false;
+
+                    if (fn_id == PSCI_VERSION) {
+                        ret = PSCI_VERSION_1_1;
+                    } else if (fn_id == PSCI_FEATURES) {
+                        // Check if a specific function is supported (x1 = fn_id)
+                        var requested: u64 = 0;
+                        _ = hv_vcpu_get_reg(vcpu, 1, &requested); // X1
+                        ret = switch (requested) {
+                            PSCI_VERSION, PSCI_SYSTEM_OFF, PSCI_SYSTEM_RESET, PSCI_FEATURES => PSCI_RET_SUCCESS,
+                            else => PSCI_RET_NOT_SUPPORTED,
+                        };
+                    } else if (fn_id == PSCI_SYSTEM_OFF) {
+                        std.debug.print("\n[VMM] PSCI: SYSTEM_OFF\n", .{});
+                        should_stop = true;
+                    } else if (fn_id == PSCI_SYSTEM_RESET) {
+                        std.debug.print("\n[VMM] PSCI: SYSTEM_RESET (停止扱い)\n", .{});
+                        should_stop = true;
+                    } else {
+                        std.debug.print("\n[VMM] PSCI: 未対応 fn_id=0x{X}\n", .{fn_id});
+                    }
+
+                    _ = hv_vcpu_set_reg(vcpu, HV_REG_X0, ret);
+                    // HVC は ELR_EL2 が既に PC+4 に設定されている。PC を上書きしない。
+                    if (should_stop) running = false;
+                },
+                EC_BRK => {
+                    std.debug.print("------------\n", .{});
+                    std.debug.print("[VMM] MyOS終了 (timer発火: {} 回, PC=0x{X})\n", .{ timer_fires, pc });
+                    running = false;
+                },
+                0x01 => {
+                    // WFI/WFE trap — host CPUを少しyield (1ms)、次のイベント待ち
+                    std.posix.nanosleep(0, 1_000_000);
                     _ = hv_vcpu_set_reg(vcpu, HV_REG_PC, pc + 4);
                 },
-                EC_BRK => running = false,
+                0x18 => {
+                    // MSR/MRS trap: ISS を解析
+                    const iss = syn & 0xFFFFFF;
+                    const op0: u32 = @intCast((iss >> 20) & 0x3);
+                    const op2: u32 = @intCast((iss >> 17) & 0x7);
+                    const op1: u32 = @intCast((iss >> 14) & 0x7);
+                    const crn: u32 = @intCast((iss >> 10) & 0xF);
+                    const rt: u32 = @intCast((iss >> 5) & 0x1F);
+                    const crm: u32 = @intCast((iss >> 1) & 0xF);
+                    const is_read = (iss & 1) == 1;
+                    std.debug.print("\n[VMM] sysreg trap: op0={} op1={} CRn={} CRm={} op2={} Rt=x{} {s} PC=0x{X}\n", .{
+                        op0, op1, crn, crm, op2, rt,
+                        if (is_read) "READ" else "WRITE",
+                        pc,
+                    });
+                    if (is_read) {
+                        _ = hv_vcpu_set_reg(vcpu, rt, 0);
+                    }
+                    _ = hv_vcpu_set_reg(vcpu, HV_REG_PC, pc + 4);
+                },
                 else => {
-                    std.debug.print("\n[EC=0x{X}]\n", .{ec});
+                    std.debug.print("\n[VMM] 例外 EC=0x{X} PC=0x{X}\n", .{ec, pc});
                     running = false;
                 },
             }
-        } else running = false;
+        } else if (exit_info.reason == HV_EXIT_REASON_VTIMER_ACTIVATED) {
+            // vTimer発火 → GIC内部でIRQ 27をペンディング → 配信可なら set_pending_interrupt
+            timer_fires += 1;
+            _ = hv_vcpu_set_vtimer_mask(vcpu, true);
+            if (gic.assertIrq(VTIMER_IRQ)) {
+                _ = hv_vcpu_set_pending_interrupt(vcpu, HV_INTERRUPT_TYPE_IRQ, true);
+            }
+        } else {
+            running = false;
+        }
     }
 
     _ = hv_vcpu_destroy(vcpu);
     _ = hv_vm_unmap(MEM_ADDR, MEM_SIZE);
     _ = hv_vm_destroy();
 
-    std.debug.print("------------------------------------------------------\n\n", .{});
-    std.debug.print("================================================================\n", .{});
-    std.debug.print("                     ZigVM Complete!\n", .{});
-    std.debug.print("================================================================\n", .{});
-    std.debug.print("  Implemented Features:\n", .{});
-    std.debug.print("    [x] VM Creation (Apple Hypervisor.framework)\n", .{});
-    std.debug.print("    [x] Guest Memory Mapping (Stage-2 Translation)\n", .{});
-    std.debug.print("    [x] vCPU Creation & Management\n", .{});
-    std.debug.print("    [x] VM Exit Loop\n", .{});
-    std.debug.print("    [x] MMIO Emulation (Data Abort Handling)\n", .{});
-    std.debug.print("    [x] PL011 UART Emulation\n", .{});
-    std.debug.print("    [x] System Register Access\n", .{});
-    std.debug.print("    [x] Exception Vector Table (VBAR_EL1)\n", .{});
-    std.debug.print("    [x] Virtual Timer (vTimer)\n", .{});
-    std.debug.print("    [x] Device Tree Blob (DTB) Generation\n", .{});
-    std.debug.print("    [x] ARM64 Linux Boot Protocol\n", .{});
-    std.debug.print("    [x] HVC Hypercall Handling\n", .{});
-    std.debug.print("================================================================\n", .{});
+    std.debug.print("\n========================================\n", .{});
+    std.debug.print("  ZigVM Complete!\n", .{});
+    std.debug.print("========================================\n", .{});
 }
