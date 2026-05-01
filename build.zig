@@ -16,6 +16,21 @@ pub fn build(b: *std.Build) void {
     exe.linkFramework("Hypervisor");
     b.installArtifact(exe);
 
+    // ============== zigvm-viewer (SDL2 GUI) ==============
+    const viewer = b.addExecutable(.{
+        .name = "zigvm-viewer",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/viewer_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    viewer.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    viewer.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    viewer.linkSystemLibrary("SDL2");
+    viewer.linkLibC();
+    b.installArtifact(viewer);
+
     const run_step = b.step("run", "Run zigvm (loads ../202601zigos kernel)");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);

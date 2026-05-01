@@ -162,23 +162,37 @@ zig build test
 ### Phase 8: framebuffer + macOS ウィンドウ (部分達成)
 - DTB に `simple-framebuffer` ノード追加 (1024×768 BGRA at 0x50000000)
 - Linux RAM を 256MB に縮め、その上 (0x50000000+) を FB 専用領域として hv_vm_map
-- VMM が ffplay を subprocess として起動 (`ZIGVM_DISPLAY=1` 環境変数で有効化)
-- 別スレッドで guest framebuffer メモリを 30fps で ffplay の stdin にパイプ
+- VMM が **`zigvm-viewer`** (SDL2 ベースの別バイナリ) を subprocess として起動
+- 別スレッドで guest framebuffer メモリを 30fps で viewer の stdin にパイプ
+- viewer は SDL2 で window 描画 + キーボードイベントを stdout で zigvm に返す
+- zigvm 側で受け取ったキーバイトを PL011 RX FIFO へ push (= 普通のシリアル入力扱い)
 - `ZIGVM_DISPLAY=1 ./zig-out/bin/zigvm Image initramfs` で macOS ウィンドウ表示
 
-#### ⚠️ 既知の問題: simpledrm が PL011 と衝突
-- Alpine kernel の `simpledrm.ko` を `modprobe` で全依存ロードすると console_on_rootfs で `__setup_irq` が panic
-- 原因: simpledrm が console を fb に切替後、PL011 driver の IRQ 再登録がコケる
-- 現状: FB DTノードは保持、`insmod` はせず → ウィンドウは開くが Linux が描画しないので **黒画面**
-- 対話シェル (ttyAMA0 経由) は引き続き動作
+#### 最終達成状態
+- ✅ **ウィンドウ表示**: kernel printk が fbcon 経由で window に描画される
+- ✅ **キー入力配線**: viewer 上で打鍵 → SDL → pipe → PL011 RX → ttyAMA0 へ届く
+- ✅ **ターミナル経由 shell**: PL011 (host stdout/stdin) で対話 shell 動作
 
-#### 真の GUI Linux に必要な追加実装
+#### ⚠️ 詰み: window で打鍵 → fbcon shell が echo されない
+1. simpledrm を modprobe ロードすると fbcon takeover ✓
+2. その直後 kernel が **soft lockup**: `watchdog: BUG: soft lockup - CPU#0 stuck for 22s`
+3. /init の続き (`exec /bin/sh -i`) まで到達できず shell 起動せず
+4. キー入力は流れるが受け手 (shell) が居ない
+
+**根因推定**: 我々の最小 GICv2 + WFI/SDL/IRQ ハンドリングが simpledrm の DRM 初期化シーケンスでデッドロック。深掘り未実施。
+
+#### Window で実用 shell に必要な追加実装
 
 | 方針 | 規模 | 状況 |
 |---|---|---|
-| simpledrm panic 解明 | 中 | 未調査 |
-| VirtIO-GPU 実装 | 数千行 | 未着手 |
-| VirtIO Net + SSH (擬似GUI) | 中-大 | 未着手 |
+| simpledrm hang の解明 (GIC 精密化, WFI semantics) | 中-大 | 未調査 |
+| VirtIO-input 実装 → fbcon shell に直接 keystroke | 中 | 未着手 |
+| VirtIO-GPU 実装 (simpledrm の代替) | 数千行 | 未着手 |
+| VirtIO Net + SSH 接続 | 中-大 | 未着手 |
+
+#### 現実的な使い方
+- `./zig-out/bin/zigvm Image initramfs` (display なし) → ターミナル対話 shell
+- 既存 GUI Linux ツール (UTM/Lima) は数十万行越え。本プロジェクトは "純Zig + 最小実装" の枠で完了とする。
 
 ### コード整理
 - `src/hv.zig` 新設し、Hypervisor.framework extern 宣言 + HV/EC/PSCI 定数を集約

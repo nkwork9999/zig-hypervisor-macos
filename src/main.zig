@@ -5,6 +5,27 @@ const dtb = @import("dtb.zig");
 const gic_mod = @import("gic.zig");
 const pl011_mod = @import("pl011.zig");
 
+// 別スレッド: 33ms ごとに guest framebuffer を viewer の stdin (パイプ) に送る
+const FbDumperArgs = struct {
+    guest_mem: []u8,
+    fb_offset: usize,
+    fb_size: usize,
+    pipe_fd: std.posix.fd_t,
+};
+
+fn fbDumperThread(args: FbDumperArgs) void {
+    const fb = args.guest_mem[args.fb_offset..][0..args.fb_size];
+    while (true) {
+        std.posix.nanosleep(0, 33_000_000); // ~30 fps
+        var written: usize = 0;
+        while (written < fb.len) {
+            const n = std.posix.write(args.pipe_fd, fb[written..]) catch return;
+            if (n == 0) return;
+            written += n;
+        }
+    }
+}
+
 // hv 名前空間のショートカット
 const HV_SUCCESS = hv.HV_SUCCESS;
 const HV_REG_X0 = hv.HV_REG_X0;
@@ -45,27 +66,6 @@ fn uart_out(c: u8) void {
     std.debug.print("{c}", .{c});
 }
 
-const FbDumperArgs = struct {
-    guest_mem: []u8,
-    fb_offset: usize,
-    fb_size: usize,
-    pipe_fd: std.posix.fd_t,
-};
-
-// 別スレッド: 33ms ごとに guest framebuffer メモリを ffplay の stdin に送る
-fn fbDumperThread(args: FbDumperArgs) void {
-    const fb = args.guest_mem[args.fb_offset..][0..args.fb_size];
-    while (true) {
-        std.posix.nanosleep(0, 33_000_000); // ~30 fps
-        // パイプは部分書き込みされるので全バイト書ききるループ
-        var written: usize = 0;
-        while (written < fb.len) {
-            const n = std.posix.write(args.pipe_fd, fb[written..]) catch return;
-            if (n == 0) return;
-            written += n;
-        }
-    }
-}
 
 // PSCI function IDs (SMC32 variant, prefix 0x84)
 const PSCI_VERSION: u64 = 0x84000000;
@@ -344,7 +344,7 @@ pub fn main() !void {
         .uart_base = UART_BASE,
         .gic_dist_base = GIC_DIST_BASE,
         .gic_cpu_base = GIC_CPU_BASE,
-        .bootargs = "console=ttyAMA0 earlycon=pl011,0x9000000 single usbdelay=1",
+        .bootargs = "console=ttyAMA0 earlycon=pl011,0x9000000 single usbdelay=1 fbcon=off",
         .initrd_start = if (initrd_size > 0) INITRD_LOAD_ADDR else 0,
         .initrd_end = if (initrd_size > 0) INITRD_LOAD_ADDR + initrd_size else 0,
         .fb_base = FB_BASE,
@@ -435,39 +435,41 @@ pub fn main() !void {
     std.debug.print("[VMM] vCPU開始\n", .{});
     std.debug.print("--- MyOS ---\n", .{});
 
-    // ffplay でフレームバッファをmacOSウィンドウ表示 (環境変数で有効化)
+    // zigvm-viewer 子プロセス起動 (環境変数 ZIGVM_DISPLAY=1)
     const display_enabled = std.posix.getenv("ZIGVM_DISPLAY") != null;
     var fb_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer fb_arena.deinit();
+    var viewer_keys_fd: posix.fd_t = -1;
     if (display_enabled) {
-        var size_buf: [16]u8 = undefined;
-        const size_str = std.fmt.bufPrint(&size_buf, "{}x{}", .{ FB_WIDTH, FB_HEIGHT }) catch unreachable;
-        var child = std.process.Child.init(&.{
-            "ffplay",
-            "-f",            "rawvideo",
-            "-pixel_format", "bgra",
-            "-video_size",   size_str,
-            "-framerate",    "30",
-            "-window_title", "ZigVM Linux",
-            "-i",            "-",
-        }, fb_arena.allocator());
+        var wbuf: [16]u8 = undefined;
+        var hbuf: [16]u8 = undefined;
+        const w_str = std.fmt.bufPrint(&wbuf, "{}", .{FB_WIDTH}) catch unreachable;
+        const h_str = std.fmt.bufPrint(&hbuf, "{}", .{FB_HEIGHT}) catch unreachable;
+        // viewer 実行ファイルは zigvm と同じディレクトリにある想定
+        var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_path = std.fs.selfExePath(&exe_path_buf) catch "./zig-out/bin/zigvm";
+        const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+        const viewer_path = std.fmt.allocPrint(fb_arena.allocator(), "{s}/zigvm-viewer", .{exe_dir}) catch "./zig-out/bin/zigvm-viewer";
+        var child = std.process.Child.init(&.{ viewer_path, w_str, h_str }, fb_arena.allocator());
         child.stdin_behavior = .Pipe;
-        // ffplay の stdout/stderr は親に流す (ユーザーが見える)
-        child.stdout_behavior = .Inherit;
+        child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
-        const spawn_ok = blk: {
-            child.spawn() catch |e| {
-                std.debug.print("[VMM] ffplay起動失敗: {} (PATHにffplayあるか?)\n", .{e});
-                break :blk false;
-            };
-            break :blk true;
+        child.spawn() catch |e| {
+            std.debug.print("[VMM] zigvm-viewer起動失敗: {}\n", .{e});
         };
-        if (spawn_ok) if (child.stdin) |stdin| {
-            const fb_offset: usize = @intCast(FB_BASE - MEM_ADDR);
+        if (child.stdin) |stdin| if (child.stdout) |stdout| {
+            // viewer の stdout (key events) を non-blocking に
+            const F_GETFL_p: i32 = 3;
+            const F_SETFL_p: i32 = 4;
+            const O_NONBLOCK_p: u32 = 0x0004;
+            const flags2 = std.c.fcntl(stdout.handle, F_GETFL_p, @as(i32, 0));
+            _ = std.c.fcntl(stdout.handle, F_SETFL_p, flags2 | @as(i32, @intCast(O_NONBLOCK_p)));
+            viewer_keys_fd = stdout.handle;
+
             const fb_args: FbDumperArgs = .{
                 .guest_mem = guest_mem,
-                .fb_offset = fb_offset,
-                .fb_size = @as(usize, FB_SIZE),
+                .fb_offset = @intCast(FB_BASE - MEM_ADDR),
+                .fb_size = @intCast(FB_SIZE),
                 .pipe_fd = stdin.handle,
             };
             const t = std.Thread.spawn(.{}, fbDumperThread, .{fb_args}) catch |e| {
@@ -475,9 +477,8 @@ pub fn main() !void {
                 return;
             };
             t.detach();
-            std.debug.print("[VMM] ffplay window 起動 ({}x{}, 30fps)\n", .{ FB_WIDTH, FB_HEIGHT });
+            std.debug.print("[VMM] zigvm-viewer 起動 ({}x{}, 30fps)\n", .{ FB_WIDTH, FB_HEIGHT });
         };
-        // ffplay は終了させずに親終了で自然に閉じさせる
     }
 
     // 実行ループ
@@ -491,6 +492,14 @@ pub fn main() !void {
         const n = posix.read(stdin_fd, &sbuf) catch 0;
         if (n > 0) {
             for (sbuf[0..n]) |c| pl011.pushRxChar(c);
+        }
+        // 1b) viewer (SDL) からのキー入力を pl011 RX へ
+        if (viewer_keys_fd >= 0) {
+            var kbuf: [16]u8 = undefined;
+            const kn = posix.read(viewer_keys_fd, &kbuf) catch 0;
+            if (kn > 0) {
+                for (kbuf[0..kn]) |c| pl011.pushRxChar(c);
+            }
         }
         // 2) PL011 RX IRQ pending → GIC SPI 1 配信 (毎ループでチェック)
         if (pl011.rxIrqPending() and gic.assertIrq(PL011_IRQ)) {
