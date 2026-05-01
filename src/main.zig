@@ -45,6 +45,28 @@ fn uart_out(c: u8) void {
     std.debug.print("{c}", .{c});
 }
 
+const FbDumperArgs = struct {
+    guest_mem: []u8,
+    fb_offset: usize,
+    fb_size: usize,
+    pipe_fd: std.posix.fd_t,
+};
+
+// 別スレッド: 33ms ごとに guest framebuffer メモリを ffplay の stdin に送る
+fn fbDumperThread(args: FbDumperArgs) void {
+    const fb = args.guest_mem[args.fb_offset..][0..args.fb_size];
+    while (true) {
+        std.posix.nanosleep(0, 33_000_000); // ~30 fps
+        // パイプは部分書き込みされるので全バイト書ききるループ
+        var written: usize = 0;
+        while (written < fb.len) {
+            const n = std.posix.write(args.pipe_fd, fb[written..]) catch return;
+            if (n == 0) return;
+            written += n;
+        }
+    }
+}
+
 // PSCI function IDs (SMC32 variant, prefix 0x84)
 const PSCI_VERSION: u64 = 0x84000000;
 const PSCI_CPU_OFF: u64 = 0x84000002;
@@ -62,8 +84,14 @@ const UART_BASE: u64 = 0x09000000;
 const TIMER_SLEEP_ADDR: u64 = 0x09001000;
 const GIC_DIST_BASE: u64 = 0x08000000; // GICv2 Distributor
 const GIC_CPU_BASE: u64 = 0x08010000; // GICv2 CPU Interface
-const DTB_LOAD_ADDR: u64 = 0x44000000; // メモリ上端付近 (mem内)
-const INITRD_LOAD_ADDR: u64 = 0x45000000; // DTBより上、initramfs用
+const DTB_LOAD_ADDR: u64 = 0x44000000;
+const INITRD_LOAD_ADDR: u64 = 0x45000000;
+// simple-framebuffer (1024x768 BGRA = 3MB)
+const FB_BASE: u64 = 0x50000000;
+const FB_WIDTH: u32 = 1024;
+const FB_HEIGHT: u32 = 768;
+const FB_BYTES_PER_PIXEL: u32 = 4;
+const FB_SIZE: u64 = @as(u64, FB_WIDTH) * FB_HEIGHT * FB_BYTES_PER_PIXEL;
 
 // ============== ELF Loader ==============
 
@@ -308,15 +336,20 @@ pub fn main() !void {
     }
 
     // DTB 生成 & ゲストメモリにコピー
+    // FB 領域はLinuxのRAMの外 (0x50000000) に置く。memは0x40000000-0x50000000の256MB に縮める
+    const linux_ram_size: u64 = FB_BASE - MEM_ADDR; // 256MB
     const dtb_bytes = dtb.buildZigVmDtb(std.heap.page_allocator, .{
         .mem_base = MEM_ADDR,
-        .mem_size = MEM_SIZE,
+        .mem_size = linux_ram_size,
         .uart_base = UART_BASE,
         .gic_dist_base = GIC_DIST_BASE,
         .gic_cpu_base = GIC_CPU_BASE,
-        .bootargs = "console=ttyAMA0 earlycon=pl011,0x9000000 single usbdelay=1 quiet loglevel=3",
+        .bootargs = "console=ttyAMA0 earlycon=pl011,0x9000000 single usbdelay=1",
         .initrd_start = if (initrd_size > 0) INITRD_LOAD_ADDR else 0,
         .initrd_end = if (initrd_size > 0) INITRD_LOAD_ADDR + initrd_size else 0,
+        .fb_base = FB_BASE,
+        .fb_width = FB_WIDTH,
+        .fb_height = FB_HEIGHT,
     }) catch {
         std.debug.print("[VMM] DTB生成失敗\n", .{});
         _ = hv_vm_destroy();
@@ -401,6 +434,51 @@ pub fn main() !void {
     std.debug.print("[VMM] vTimer offset: 0x{X}\n", .{vtimer_offset});
     std.debug.print("[VMM] vCPU開始\n", .{});
     std.debug.print("--- MyOS ---\n", .{});
+
+    // ffplay でフレームバッファをmacOSウィンドウ表示 (環境変数で有効化)
+    const display_enabled = std.posix.getenv("ZIGVM_DISPLAY") != null;
+    var fb_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer fb_arena.deinit();
+    if (display_enabled) {
+        var size_buf: [16]u8 = undefined;
+        const size_str = std.fmt.bufPrint(&size_buf, "{}x{}", .{ FB_WIDTH, FB_HEIGHT }) catch unreachable;
+        var child = std.process.Child.init(&.{
+            "ffplay",
+            "-f",            "rawvideo",
+            "-pixel_format", "bgra",
+            "-video_size",   size_str,
+            "-framerate",    "30",
+            "-window_title", "ZigVM Linux",
+            "-i",            "-",
+        }, fb_arena.allocator());
+        child.stdin_behavior = .Pipe;
+        // ffplay の stdout/stderr は親に流す (ユーザーが見える)
+        child.stdout_behavior = .Inherit;
+        child.stderr_behavior = .Inherit;
+        const spawn_ok = blk: {
+            child.spawn() catch |e| {
+                std.debug.print("[VMM] ffplay起動失敗: {} (PATHにffplayあるか?)\n", .{e});
+                break :blk false;
+            };
+            break :blk true;
+        };
+        if (spawn_ok) if (child.stdin) |stdin| {
+            const fb_offset: usize = @intCast(FB_BASE - MEM_ADDR);
+            const fb_args: FbDumperArgs = .{
+                .guest_mem = guest_mem,
+                .fb_offset = fb_offset,
+                .fb_size = @as(usize, FB_SIZE),
+                .pipe_fd = stdin.handle,
+            };
+            const t = std.Thread.spawn(.{}, fbDumperThread, .{fb_args}) catch |e| {
+                std.debug.print("[VMM] fb dumper thread起動失敗: {}\n", .{e});
+                return;
+            };
+            t.detach();
+            std.debug.print("[VMM] ffplay window 起動 ({}x{}, 30fps)\n", .{ FB_WIDTH, FB_HEIGHT });
+        };
+        // ffplay は終了させずに親終了で自然に閉じさせる
+    }
 
     // 実行ループ
     var running = true;

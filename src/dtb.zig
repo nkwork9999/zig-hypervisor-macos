@@ -280,7 +280,11 @@ pub const ZigVmDtbConfig = struct {
     gic_cpu_size: u64 = 0x10000,
     bootargs: []const u8 = "",
     initrd_start: u64 = 0,
-    initrd_end: u64 = 0, // 0/0 means no initrd
+    initrd_end: u64 = 0,
+    // simple-framebuffer (BGRA 32bpp). 0 にすると無効
+    fb_base: u64 = 0,
+    fb_width: u32 = 0,
+    fb_height: u32 = 0,
 };
 
 pub const GIC_PHANDLE: u32 = 1;
@@ -403,6 +407,25 @@ pub fn buildZigVmDtb(allocator: std.mem.Allocator, cfg: ZigVmDtbConfig) ![]u8 {
     try b.propCells("clocks", &[_]u32{ APB_PCLK_PHANDLE, APB_PCLK_PHANDLE });
     try b.propStringList("clock-names", &[_][]const u8{ "uartclk", "apb_pclk" });
     try b.endNode();
+
+    // /framebuffer@<addr>: Linux simple-framebuffer driver
+    if (cfg.fb_base != 0 and cfg.fb_width > 0 and cfg.fb_height > 0) {
+        var fb_name_buf: [40]u8 = undefined;
+        const fb_name = try std.fmt.bufPrint(&fb_name_buf, "framebuffer@{x}", .{cfg.fb_base});
+        const stride = cfg.fb_width * 4; // BGRA 32bpp
+        const fb_size: u64 = @as(u64, stride) * cfg.fb_height;
+        try b.beginNode(fb_name);
+        try b.propString("compatible", "simple-framebuffer");
+        try b.propCells("reg", &[_]u32{
+            @intCast(cfg.fb_base >> 32), @intCast(cfg.fb_base & 0xFFFF_FFFF),
+            @intCast(fb_size >> 32),     @intCast(fb_size & 0xFFFF_FFFF),
+        });
+        try b.propU32("width", cfg.fb_width);
+        try b.propU32("height", cfg.fb_height);
+        try b.propU32("stride", stride);
+        try b.propString("format", "a8r8g8b8");
+        try b.endNode();
+    }
 
     try b.endNode(); // root
 
@@ -770,6 +793,31 @@ test "GIC and apb_pclk phandles are distinct" {
     try testing.expect(GIC_PHANDLE != APB_PCLK_PHANDLE);
     try testing.expectEqual(@as(u32, 1), GIC_PHANDLE);
     try testing.expectEqual(@as(u32, 2), APB_PCLK_PHANDLE);
+}
+
+test "framebuffer node only present when configured" {
+    // No fb config: not present
+    {
+        const dtb = try buildZigVmDtb(testing.allocator, .{});
+        defer testing.allocator.free(dtb);
+        const h = try parseHeader(dtb);
+        const struct_block = dtb[h.off_dt_struct..][0..h.size_dt_struct];
+        try testing.expect(std.mem.indexOf(u8, struct_block, "simple-framebuffer") == null);
+    }
+    // With fb config: present
+    {
+        const dtb = try buildZigVmDtb(testing.allocator, .{
+            .fb_base = 0x50000000,
+            .fb_width = 1024,
+            .fb_height = 768,
+        });
+        defer testing.allocator.free(dtb);
+        const h = try parseHeader(dtb);
+        const struct_block = dtb[h.off_dt_struct..][0..h.size_dt_struct];
+        try testing.expect(std.mem.indexOf(u8, struct_block, "simple-framebuffer") != null);
+        try testing.expect(std.mem.indexOf(u8, struct_block, "framebuffer@50000000") != null);
+        try testing.expect(std.mem.indexOf(u8, struct_block, "a8r8g8b8") != null);
+    }
 }
 
 test "buildZigVmDtb default mem_size is 128MB" {

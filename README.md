@@ -159,6 +159,27 @@ zig build test
 - `quiet loglevel=3` で kernel boot メッセージを抑制
 - ASCII art バナー付き init script
 
+### Phase 8: framebuffer + macOS ウィンドウ (部分達成)
+- DTB に `simple-framebuffer` ノード追加 (1024×768 BGRA at 0x50000000)
+- Linux RAM を 256MB に縮め、その上 (0x50000000+) を FB 専用領域として hv_vm_map
+- VMM が ffplay を subprocess として起動 (`ZIGVM_DISPLAY=1` 環境変数で有効化)
+- 別スレッドで guest framebuffer メモリを 30fps で ffplay の stdin にパイプ
+- `ZIGVM_DISPLAY=1 ./zig-out/bin/zigvm Image initramfs` で macOS ウィンドウ表示
+
+#### ⚠️ 既知の問題: simpledrm が PL011 と衝突
+- Alpine kernel の `simpledrm.ko` を `modprobe` で全依存ロードすると console_on_rootfs で `__setup_irq` が panic
+- 原因: simpledrm が console を fb に切替後、PL011 driver の IRQ 再登録がコケる
+- 現状: FB DTノードは保持、`insmod` はせず → ウィンドウは開くが Linux が描画しないので **黒画面**
+- 対話シェル (ttyAMA0 経由) は引き続き動作
+
+#### 真の GUI Linux に必要な追加実装
+
+| 方針 | 規模 | 状況 |
+|---|---|---|
+| simpledrm panic 解明 | 中 | 未調査 |
+| VirtIO-GPU 実装 | 数千行 | 未着手 |
+| VirtIO Net + SSH (擬似GUI) | 中-大 | 未着手 |
+
 ### コード整理
 - `src/hv.zig` 新設し、Hypervisor.framework extern 宣言 + HV/EC/PSCI 定数を集約
 - `src/main copy.zig` と Zig テンプレート残骸 `src/root.zig` を削除
